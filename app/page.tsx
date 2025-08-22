@@ -50,6 +50,8 @@ interface DetectionHistory {
   blinkStates: boolean[]
   timestamps: number[]
   maxHistoryLength: number
+  eyeClosureStartTime: number | null
+  lastEyeClosureDuration: number
 }
 
 interface AlertConfig {
@@ -89,6 +91,18 @@ interface AnalyticsData {
   maxDataPoints: number
 }
 
+interface Stats {
+  eyeAspectRatio: number
+  blinkCount: number
+  alertCount: number
+  faceDetected: boolean
+  blinkRate: number
+  avgEAR: number
+  drowsinessScore: number
+  eyeClosureDuration: number
+  currentEAR: number
+}
+
 export default function DrowsinessDetectionPage() {
   const videoRef = useRef<HTMLVideoElement>(null)
   const canvasRef = useRef<HTMLCanvasElement>(null)
@@ -101,7 +115,9 @@ export default function DrowsinessDetectionPage() {
     earValues: [],
     blinkStates: [],
     timestamps: [],
-    maxHistoryLength: 30, // 30 frames of history (~1 second at 30fps)
+    maxHistoryLength: 100,
+    eyeClosureStartTime: null,
+    lastEyeClosureDuration: 0,
   })
 
   const lastBlinkRef = useRef<number>(0)
@@ -115,7 +131,7 @@ export default function DrowsinessDetectionPage() {
   const [modelLoaded, setModelLoaded] = useState(false)
   const [notificationPermission, setNotificationPermission] = useState<NotificationPermission>("default")
 
-  const [stats, setStats] = useState({
+  const [stats, setStats] = useState<Stats>({
     eyeAspectRatio: 0,
     blinkCount: 0,
     alertCount: 0,
@@ -123,6 +139,8 @@ export default function DrowsinessDetectionPage() {
     blinkRate: 0, // blinks per minute
     avgEAR: 0,
     drowsinessScore: 0,
+    eyeClosureDuration: 0,
+    currentEAR: 0,
   })
 
   const [config, setConfig] = useState<DrowsinessConfig>({
@@ -157,6 +175,7 @@ export default function DrowsinessDetectionPage() {
   })
 
   const [activeTab, setActiveTab] = useState("detection")
+  const [lastAlertTime, setLastAlertTime] = useState(0)
 
   const startSession = useCallback(() => {
     const sessionId = `session_${Date.now()}`
@@ -518,11 +537,35 @@ export default function DrowsinessDetectionPage() {
       history.blinkStates.shift()
     }
 
-    // Detect blink
-    const isBlink = currentEAR < config.blinkThreshold
+    const isEyesClosed = currentEAR < config.earThreshold
+    let eyeClosureDuration = 0
+
+    if (isEyesClosed) {
+      // Eyes are closed
+      if (history.eyeClosureStartTime === null) {
+        // Start tracking eye closure
+        history.eyeClosureStartTime = timestamp
+        console.log("[v0] Started tracking eye closure at:", new Date(timestamp).toLocaleTimeString())
+      }
+      eyeClosureDuration = timestamp - history.eyeClosureStartTime
+    } else {
+      // Eyes are open
+      if (history.eyeClosureStartTime !== null) {
+        // Eyes just opened, record the closure duration
+        history.lastEyeClosureDuration = timestamp - history.eyeClosureStartTime
+        console.log("[v0] Eye closure ended. Duration:", history.lastEyeClosureDuration, "ms")
+        history.eyeClosureStartTime = null
+      }
+      eyeClosureDuration = 0
+    }
+
+    // Detect blink vs sustained closure
+    const isBlink = isEyesClosed && eyeClosureDuration < 500 // Blinks are typically < 500ms
+    const isSustainedClosure = eyeClosureDuration >= 3000 // 3 seconds or more
+
     history.blinkStates.push(isBlink)
 
-    // Count blinks in the last minute
+    // Count blinks in the last minute (exclude sustained closures)
     const oneMinuteAgo = timestamp - 60000
     const recentBlinks = history.timestamps.reduce((count, ts, index) => {
       if (ts > oneMinuteAgo && history.blinkStates[index]) {
@@ -544,12 +587,20 @@ export default function DrowsinessDetectionPage() {
     // Calculate drowsiness score (0-100)
     const earScore = Math.max(0, ((config.earThreshold - avgEAR) / config.earThreshold) * 100)
     const blinkScore = Math.max(0, ((15 - recentBlinks) / 15) * 100) // Normal blink rate ~15-20/min
-    const drowsinessScore = Math.min(100, (earScore + blinkScore) / 2)
+    let drowsinessScore = Math.min(100, (earScore + blinkScore) / 2)
+
+    if (isSustainedClosure) {
+      drowsinessScore = Math.max(drowsinessScore, 95) // Force high score for 3+ second closure
+    }
 
     let alertLevel: AlertState["level"] = "low"
     let alertMessage = ""
 
-    if (drowsinessScore > 80) {
+    if (isSustainedClosure) {
+      alertLevel = "critical"
+      alertMessage = `CRITICAL: Eyes closed for ${Math.round(eyeClosureDuration / 1000)} seconds! Wake up immediately!`
+      console.log("[v0] SUSTAINED EYE CLOSURE DETECTED:", eyeClosureDuration, "ms")
+    } else if (drowsinessScore > 80) {
       alertLevel = "critical"
       alertMessage = "CRITICAL: Severe drowsiness detected! Please stop and rest immediately."
     } else if (drowsinessScore > 60) {
@@ -564,13 +615,14 @@ export default function DrowsinessDetectionPage() {
     }
 
     return {
-      isDrowsy,
+      isDrowsy: isDrowsy || isSustainedClosure,
       blinkRate: recentBlinks,
       avgEAR,
       drowsinessScore,
-      shouldAlert: isDrowsy && timestamp - lastAlertRef.current > config.alertCooldown,
       alertLevel,
       alertMessage,
+      eyeClosureDuration,
+      isSustainedClosure,
     }
   }
 
@@ -666,28 +718,36 @@ export default function DrowsinessDetectionPage() {
           }
         }
 
+        if (analysis.isSustainedClosure && alertState.level !== "critical") {
+          console.log("[v0] Triggering sustained closure alert")
+          triggerAlert(analysis.alertLevel, analysis.alertMessage)
+        } else if (analysis.isDrowsy && Date.now() - lastAlertTime > config.alertCooldown) {
+          triggerAlert(analysis.alertLevel, analysis.alertMessage)
+          setLastAlertTime(Date.now())
+        }
+
+        // Update statistics
         setStats((prev) => ({
           ...prev,
-          eyeAspectRatio: avgEAR,
-          faceDetected: true,
+          currentEAR: avgEAR,
           blinkRate: analysis.blinkRate,
-          avgEAR: analysis.avgEAR,
           drowsinessScore: analysis.drowsinessScore,
+          eyeClosureDuration: analysis.eyeClosureDuration,
+          faceDetected: true,
+          eyeAspectRatio: avgEAR,
           blinkCount:
             prev.blinkCount + (avgEAR < config.blinkThreshold && timestamp - lastBlinkRef.current > 200 ? 1 : 0),
-          alertCount: prev.alertCount + (analysis.shouldAlert ? 1 : 0),
+          alertCount: prev.alertCount + (analysis.alertLevel !== "low" ? 1 : 0),
         }))
 
-        updateAnalytics(avgEAR, analysis.drowsinessScore, analysis.shouldAlert ? analysis.alertLevel : undefined)
+        updateAnalytics(
+          avgEAR,
+          analysis.drowsinessScore,
+          analysis.alertLevel !== "low" ? analysis.alertLevel : undefined,
+        )
 
         if (avgEAR < config.blinkThreshold && timestamp - lastBlinkRef.current > 200) {
           lastBlinkRef.current = timestamp
-        }
-
-        if (analysis.shouldAlert) {
-          lastAlertRef.current = timestamp
-          consecutiveDrowsyFramesRef.current = 0
-          triggerAlert(analysis.alertLevel, analysis.alertMessage)
         }
 
         if (analysis.isDrowsy) {
@@ -702,6 +762,10 @@ export default function DrowsinessDetectionPage() {
           ...prev,
           faceDetected: false,
           eyeAspectRatio: 0,
+          currentEAR: 0,
+          blinkRate: 0,
+          drowsinessScore: 0,
+          eyeClosureDuration: 0,
         }))
         setDetectionStatus("active")
       }
@@ -711,7 +775,7 @@ export default function DrowsinessDetectionPage() {
 
     // Continue detection loop
     animationRef.current = requestAnimationFrame(detectFaceAndEyes)
-  }, [isStreaming, config, triggerAlert, updateAnalytics])
+  }, [isStreaming, config, triggerAlert, updateAnalytics, alertState.level, lastAlertTime])
 
   const startCamera = async () => {
     try {
@@ -808,7 +872,9 @@ export default function DrowsinessDetectionPage() {
       earValues: [],
       blinkStates: [],
       timestamps: [],
-      maxHistoryLength: 30,
+      maxHistoryLength: 100,
+      eyeClosureStartTime: null,
+      lastEyeClosureDuration: 0,
     }
 
     setStats((prev) => ({
@@ -818,6 +884,8 @@ export default function DrowsinessDetectionPage() {
       blinkRate: 0,
       avgEAR: 0,
       drowsinessScore: 0,
+      eyeClosureDuration: 0,
+      currentEAR: 0,
     }))
   }
 
@@ -1268,9 +1336,9 @@ export default function DrowsinessDetectionPage() {
                     <div className="text-center p-4 bg-purple-50 dark:bg-purple-950 rounded-lg">
                       <TrendingUp className="w-6 h-6 mx-auto mb-2 text-purple-600" />
                       <div className="text-2xl font-bold text-purple-600">
-                        {analytics.currentSession.maxDrowsinessScore.toFixed(0)}%
+                        {stats.eyeClosureDuration ? Math.round(stats.eyeClosureDuration / 1000) : 0}s
                       </div>
-                      <div className="text-sm text-gray-600 dark:text-gray-400">Max Drowsiness</div>
+                      <div className="text-sm text-gray-600 dark:text-gray-400">Eye Closure Duration</div>
                     </div>
                   </div>
                 </CardContent>
